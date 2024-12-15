@@ -61,9 +61,17 @@ class User(BaseModel):
 class AudioRecording(BaseModel):
     filename: str
     asha_email: EmailStr
+    patient_id: str
     supervisor_email: Optional[EmailStr] = None
-    uploaded_at: datetime = datetime.utcnow()
+    uploaded_at: datetime = Field(default_factory=datetime.utcnow)
+    notes: Optional[str] = None
 
+class PatientCreate(BaseModel):
+    name: str
+    age: int
+    gender: str
+    contact: Optional[str]
+    address: Optional[str]
+    medical_history: Optional[str]
 
-
-__all__ = ["UserBase", "SupervisorCreate", "ASHACreate", "UserLogin", "UserUpdate", "User", "AudioRecording"]
+__all__ = ["UserBase", "SupervisorCreate", "ASHACreate", "UserLogin", "UserUpdate", "User", "AudioRecording", "PatientCreate"]

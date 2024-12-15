@@ -10,13 +10,28 @@ from typing import Optional
 import random
 import os
 import requests
+import logging
+import uuid
+from fastapi.middleware.cors import CORSMiddleware
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 app = FastAPI(title="Sangath API")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 FIREBASE_API_KEY = os.getenv("FIREBASE_WEB_API_KEY")
 
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins in development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Middleware to verify Firebase ID token
 async def verify_user(token: str = Depends(oauth2_scheme)):
@@ -104,21 +119,38 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
 @app.post("/register/supervisor", status_code=status.HTTP_201_CREATED)
 async def register_supervisor(user_data: SupervisorCreate):
-    # Check if user exists
-    if db.collection("users").document(user_data.email).get().exists:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
     try:
-        # Create Firebase Auth user
-        firebase_user = auth.create_user(
-            email=user_data.email,
-            password=user_data.password,
-            phone_number=user_data.phone
-        )
+        # Debug logging
+        print(f"Attempting to register supervisor: {user_data.email}")
         
+        # Check if user exists
+        if db.collection("users").document(user_data.email).get().exists:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        
+        # Verify Firebase API key is set
+        if not FIREBASE_API_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Firebase API key not configured"
+            )
+            
+        try:
+            # Create Firebase Auth user with more detailed error handling
+            firebase_user = auth.create_user(
+                email=user_data.email,
+                password=user_data.password,
+                phone_number=user_data.phone
+            )
+        except Exception as firebase_error:
+            print(f"Firebase user creation failed: {str(firebase_error)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Firebase authentication error: {str(firebase_error)}"
+            )
+
         # Create User object for Firestore
         user_doc = {
             "email": user_data.email,
@@ -132,18 +164,35 @@ async def register_supervisor(user_data: SupervisorCreate):
             "uid": firebase_user.uid
         }
         
-        db.collection("users").document(user_data.email).set(user_doc)
+        try:
+            db.collection("users").document(user_data.email).set(user_doc)
+        except Exception as db_error:
+            print(f"Firestore operation failed: {str(db_error)}")
+            # Clean up Firebase user if Firestore fails
+            auth.delete_user(firebase_user.uid)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database error: {str(db_error)}"
+            )
+            
         return {"message": "Supervisor registered successfully"}
+        
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Unexpected error in register_supervisor: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail=f"Registration failed: {str(e)}"
         )
 
 @app.post("/create/asha", status_code=status.HTTP_201_CREATED)
 async def create_asha(asha_data: ASHACreate, current_user: dict = Depends(verify_user)):
+    logger.info(f"Attempting to create ASHA with email: {asha_data.email}")
+    
     # Verify supervisor role
     if current_user["role"] != "Supervisor":
+        logger.error(f"Unauthorized attempt to create ASHA by {current_user['email']}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only Supervisors can create ASHA accounts"
@@ -151,13 +200,17 @@ async def create_asha(asha_data: ASHACreate, current_user: dict = Depends(verify
     try:
         # Generate temporary password
         temp_password = "asha" + str(random.randint(10000, 99999))
+        logger.debug(f"Generated temporary password for {asha_data.email}")
         
         # Create Firebase Auth user
+        logger.info(f"Creating Firebase auth user for {asha_data.email}")
         firebase_user = auth.create_user(
             email=asha_data.email,
             password=temp_password,
             phone_number=asha_data.phone
         )
+        
+        logger.info(f"Firebase user created successfully with UID: {firebase_user.uid}")
         
         # Create User object for Firestore
         user_doc = {
@@ -170,12 +223,16 @@ async def create_asha(asha_data: ASHACreate, current_user: dict = Depends(verify
             "supervisor_email": current_user["email"]
         }
         
+        logger.info(f"Adding user document to Firestore for {asha_data.email}")
         db.collection("users").document(asha_data.email).set(user_doc)
+        logger.info(f"Successfully created ASHA account for {asha_data.email}")
+        
         return {"message": "ASHA created successfully", "temporary_password": temp_password}
     except Exception as e:
+        logger.error(f"Error creating ASHA account: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail=f"Error creating ASHA account: {str(e)}"
         )
 
 
@@ -271,21 +328,27 @@ async def create_patient(
     patient: PatientCreate,
     current_user: dict = Depends(verify_user)
 ):
-    if current_user["role"] != "Supervisor":
+    # Add role check
+    if current_user.get("role") != "Supervisor":
         raise HTTPException(
-            status_code=403,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="Only Supervisors can create patients"
         )
-    
+    patient_id = str(uuid.uuid4())
+
     patient_doc = {
-        **patient.dict(),
+        **patient.model_dump(),
+        "id": patient_id,
         "created_at": datetime.utcnow(),
         "created_by": current_user["email"],
         "assigned_asha": None
     }
     
-    db.collection("patients").add(patient_doc)
-    return {"message": "Patient created successfully"}
+    db.collection("patients").document(patient_id).set(patient_doc)
+    return {
+        "message": "Patient created successfully",
+        "id": patient_id  # Add this line to include ID in response
+    }
 
 
 
@@ -295,24 +358,31 @@ async def assign_asha_to_patient(
     asha_email: EmailStr,
     current_user: dict = Depends(verify_user)
 ):
+    logger.info(f"Attempting to assign ASHA {asha_email} to patient {patient_id}")
+    
     if current_user["role"] != "Supervisor":
+        logger.error(f"Unauthorized attempt to assign ASHA by {current_user['email']}")
         raise HTTPException(
             status_code=403,
             detail="Only Supervisors can assign ASHAs to patients"
         )
     
     # Verify ASHA exists
+    logger.debug(f"Verifying ASHA existence: {asha_email}")
     asha_doc = db.collection("users").document(asha_email).get()
     if not asha_doc.exists or asha_doc.to_dict()["role"] != "ASHA":
+        logger.error(f"ASHA not found or invalid role: {asha_email}")
         raise HTTPException(status_code=404, detail="ASHA not found")
     
     # Update patient document
+    logger.debug(f"Updating patient {patient_id} with ASHA assignment")
     patient_ref = db.collection("patients").document(patient_id)
     patient_ref.update({
         "assigned_asha": asha_email,
         "last_updated": datetime.utcnow()
     })
     
+    logger.info(f"Successfully assigned ASHA {asha_email} to patient {patient_id}")
     return {"message": f"ASHA {asha_email} assigned to patient {patient_id}"}
 
 
