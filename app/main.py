@@ -13,6 +13,8 @@ import requests
 import logging
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import asyncio
 
 
 logging.basicConfig(
@@ -75,45 +77,143 @@ async def verify_user(token: str = Depends(oauth2_scheme)):
             detail=str(e)
         )
 
+@app.get("/time")
+async def get_server_time():
+    return JSONResponse({
+        "server_time": int(datetime.utcnow().timestamp())
+    })
+
 @app.post("/login", response_model=dict)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    """
-    Temporary login endpoint for Swagger UI testing only.
-    Uses Firebase Admin to authenticate and provides an ID token for Swagger's OAuth2.
-    """
+async def login(form_data: UserLogin):
+    """Login with phone number and password"""
     try:
-        identifier = form_data.username
-        if identifier.startswith("+"):
-            user = auth.get_user_by_phone_number(identifier)
-        else:
-            user = auth.get_user_by_email(identifier)
+        # Get user by phone number
+        user = auth.get_user_by_phone_number(form_data.phone)
         
-        # Generate a Firebase custom token
+        # Get user data from Firestore
+        user_doc = db.collection("users").document(user.uid).get()
+        
+        if not user_doc.exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+            
+        # Generate custom token
         custom_token = auth.create_custom_token(user.uid).decode('utf-8')
         
-        # Exchange custom token for an ID token (via Firebase REST API)
+        # Exchange for ID token
         exchange_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={FIREBASE_API_KEY}"
         payload = {"token": custom_token, "returnSecureToken": True}
         response = requests.post(exchange_url, json=payload)
 
         if response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Failed to exchange custom token for ID token")
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to exchange custom token"
+            )
         
         id_token = response.json().get("idToken")
-        if not id_token:
-            raise HTTPException(status_code=500, detail="ID token not found in response")
-        
-        # Return ID token for Swagger OAuth2
         return {
             "access_token": id_token,
             "token_type": "bearer",
         }
+        
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Login failed: {str(e)}"
         )
 
+@app.post("/password-reset/request")
+async def request_password_reset(reset_data: PasswordReset):
+    """Request password reset using phone number"""
+    try:
+        # Verify phone number exists
+        user = auth.get_user_by_phone_number(reset_data.phone)
+        
+        # Generate verification code
+        verification_code = str(random.randint(100000, 999999))
+        
+        # Store verification code in Firestore with expiration
+        db.collection("password_resets").document(user.uid).set({
+            "code": verification_code,
+            "expires_at": datetime.utcnow() + timedelta(minutes=15),
+            "attempts": 0
+        })
+        
+        # TODO: Send SMS with verification code using your SMS provider
+        # For testing, just return the code (remove in production)
+        return {"message": "Reset code sent", "code": verification_code}
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid phone number"
+        )
+
+@app.post("/password-reset/verify")
+async def verify_reset_code(
+    phone: str,
+    code: str,
+    new_password: str
+):
+    """Verify reset code and set new password"""
+    try:
+        # Get user by phone
+        user = auth.get_user_by_phone_number(phone)
+        
+        # Get reset document
+        reset_doc = db.collection("password_resets").document(user.uid).get()
+        
+        if not reset_doc.exists:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No reset code requested"
+            )
+            
+        reset_data = reset_doc.to_dict()
+        
+        # Check expiration
+        if datetime.fromisoformat(str(reset_data["expires_at"])) < datetime.utcnow():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reset code expired"
+            )
+            
+        # Check attempts
+        if reset_data["attempts"] >= 3:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Too many attempts"
+            )
+            
+        # Verify code
+        if reset_data["code"] != code:
+            # Increment attempts
+            db.collection("password_resets").document(user.uid).update({
+                "attempts": reset_data["attempts"] + 1
+            })
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid code"
+            )
+            
+        # Update password
+        auth.update_user(user.uid, password=new_password)
+        
+        # Delete reset document
+        db.collection("password_resets").document(user.uid).delete()
+        
+        return {"message": "Password reset successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
 
@@ -288,6 +388,9 @@ async def get_profile(token: str = Depends(verify_user)):
     user_doc = db.collection("users").document(user_email).get()
     if not user_doc.exists:
         raise HTTPException(status_code=404, detail="User not found")
+        
+    # Return the user document data
+    return user_doc.to_dict()
     
 
 @app.post("/upload-audio/")
