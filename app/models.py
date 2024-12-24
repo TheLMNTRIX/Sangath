@@ -1,6 +1,6 @@
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
 
 class UserBase(BaseModel):
     email: EmailStr
@@ -14,7 +14,7 @@ class SupervisorCreate(UserBase):
 class ASHACreate(UserBase):
     role: str = "ASHA"
     district: Optional[str] = None
-    health_facility: Optional[str] = None
+    tehsil: Optional[str] = None
 
 class UserLogin(BaseModel):
     identifier: str  # Can be email or phone
@@ -70,8 +70,23 @@ class PatientCreate(BaseModel):
     name: str
     age: int
     gender: str
+    district: Optional[str] = None
+    assigned_ashaid: Optional[str] = None
+    block_no: Optional[str] = None
+    ward_no: Optional[str] = None
+    rch_id: Optional[str] = None
+    pregnancy_state: Optional[Literal["ANC", "PNC"]] = None
+
+    high_risk: Optional[bool] = False
+    high_risk_description: Optional[str] = None
+    @field_validator('high_risk_description')
+    def validate_high_risk_description(cls, v: Optional[str], info) -> Optional[str]:
+        if info.data.get('high_risk') and not v:
+            raise ValueError('Description is required when high risk is True')
+        return v
+    
     contact: Optional[str]
     address: Optional[str]
-    medical_history: Optional[str]
+
 
 __all__ = ["UserBase", "SupervisorCreate", "ASHACreate", "UserLogin", "UserUpdate", "User", "AudioRecording", "PatientCreate"]

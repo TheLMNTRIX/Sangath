@@ -38,36 +38,46 @@ app.add_middleware(
 # Middleware to verify Firebase ID token
 async def verify_user(token: str = Depends(oauth2_scheme)):
     try:
-        # Strip 'Bearer ' if present
         if token.startswith('Bearer '):
             token = token.split(' ')[1]
         
-        print(f"Verifying token: {token[:50]}...")  # Debug log
+        print(f"Verifying token: {token[:50]}...")
         
         try:
-            # Try as ID token
             decoded_token = auth.verify_id_token(token)
         except Exception as e:
             print(f"Token: {token[:50]} Token verification failed: {str(e)}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Token: {token[:50]} Token verification failed: {str(e)}"
+                detail=f"Token verification failed: {str(e)}"
             )
         
-        # Get user data
+        # Get user data from Firebase Auth
         user = auth.get_user(decoded_token['uid'])
+        
+        # First try to get document by email (for supervisors)
         user_doc = db.collection("users").document(user.email).get()
         
+        # If not found, query by UID to find ASHA document
         if not user_doc.exists:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found in database"
-            )
+            # Query the collection to find document with matching uid
+            query = db.collection("users").where("uid", "==", user.uid).limit(1)
+            docs = query.stream()
+            user_docs = list(docs)
             
+            if not user_docs:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found in database"
+                )
+            user_doc = user_docs[0]
+            
+        user_data = user_doc.to_dict()
         return {
             "email": user.email,
             "uid": user.uid,
-            "role": user_doc.to_dict().get("role")
+            "role": user_data.get("role"),
+            "doc_id": user_doc.id  # Include document ID for future reference
         }
         
     except Exception as e:
@@ -206,6 +216,13 @@ async def create_asha(asha_data: ASHACreate, current_user: dict = Depends(verify
             detail="Only Supervisors can create ASHA accounts"
         )    
     try:
+        # Generate 6-digit ASHA ID
+        while True:
+            asha_id = str(random.randint(100000, 999999))
+            # Check if ID already exists
+            if not db.collection("users").document(asha_id).get().exists:
+                break
+                
         # Generate temporary password
         temp_password = "asha" + str(random.randint(10000, 99999))
         logger.debug(f"Generated temporary password for {asha_data.email}")
@@ -223,6 +240,7 @@ async def create_asha(asha_data: ASHACreate, current_user: dict = Depends(verify
         # Create User object for Firestore
         user_doc = {
             **asha_data.model_dump(),
+            "asha_id": asha_id,
             "created_at": datetime.utcnow(),
             "is_active": True,
             "first_login": True,
@@ -232,10 +250,14 @@ async def create_asha(asha_data: ASHACreate, current_user: dict = Depends(verify
         }
         
         logger.info(f"Adding user document to Firestore for {asha_data.email}")
-        db.collection("users").document(asha_data.email).set(user_doc)
+        db.collection("users").document(asha_id).set(user_doc)
         logger.info(f"Successfully created ASHA account for {asha_data.email}")
         
-        return {"message": "ASHA created successfully", "temporary_password": temp_password}
+        return {
+            "message": "ASHA created successfully", 
+            "temporary_password": temp_password,
+            "asha_id": asha_id
+        }
     except Exception as e:
         logger.error(f"Error creating ASHA account: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -325,13 +347,7 @@ async def list_audio_recordings(token: str = Depends(verify_user)):
     recordings = db.collection("audio_recordings").stream()
     return [AudioRecording(**r.to_dict()) for r in recordings]
 
-@app.post("/assign-asha/")
-async def assign_asha(asha_email: EmailStr, supervisor_email: EmailStr, token: str = Depends(verify_user)):
-    user = auth.verify_id_token(token)
-    if user.get("role") != "Supervisor":
-        raise HTTPException(status_code=403, detail="Only Supervisors can assign ASHAs.")
-    # Logic for assignment can be implemented here (update Firestore with the relationship)
-    return {"message": f"ASHA {asha_email} assigned to Supervisor {supervisor_email}."}
+
 
 
 @app.post("/patients/create")
@@ -339,37 +355,48 @@ async def create_patient(
     patient: PatientCreate,
     current_user: dict = Depends(verify_user)
 ):
-    # Add role check
-    if current_user.get("role") != "Supervisor":
+    """Create a new patient record"""
+    logger.info(f"Attempting to create patient by user: {current_user['email']}")
+    
+    # Check role first
+    if current_user["role"] != "Supervisor":
+        logger.error(f"Unauthorized attempt to create patient by {current_user['email']} with role {current_user['role']}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only Supervisors can create patients"
         )
-    patient_id = str(uuid.uuid4())
 
-    patient_doc = {
-        **patient.model_dump(),
-        "id": patient_id,
-        "created_at": datetime.utcnow(),
-        "created_by": current_user["email"],
-        "assigned_asha": None
-    }
-    
-    db.collection("patients").document(patient_id).set(patient_doc)
-    return {
-        "message": "Patient created successfully",
-        "id": patient_id  # Add this line to include ID in response
-    }
+    try:
+        patient_id = str(uuid.uuid4())
+        patient_doc = {
+            **patient.model_dump(),
+            "id": patient_id,
+            "created_at": datetime.utcnow(),
+            "created_by": current_user["email"],
+            "assigned_asha": None
+        }
+        
+        db.collection("patients").document(patient_id).set(patient_doc)
+        return {
+            "message": "Patient created successfully",
+            "id": patient_id
+        }
+    except Exception as e:
+        logger.error(f"Error creating patient: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating patient: {str(e)}"
+        )
 
 
 
 @app.post("/patients/{patient_id}/assign-asha")
 async def assign_asha_to_patient(
     patient_id: str,
-    asha_email: EmailStr,
+    asha_id: str,
     current_user: dict = Depends(verify_user)
 ):
-    logger.info(f"Attempting to assign ASHA {asha_email} to patient {patient_id}")
+    logger.info(f"Attempting to assign ASHA {asha_id} to patient {patient_id}")
     
     if current_user["role"] != "Supervisor":
         logger.error(f"Unauthorized attempt to assign ASHA by {current_user['email']}")
@@ -379,23 +406,22 @@ async def assign_asha_to_patient(
         )
     
     # Verify ASHA exists
-    logger.debug(f"Verifying ASHA existence: {asha_email}")
-    asha_doc = db.collection("users").document(asha_email).get()
+    logger.debug(f"Verifying ASHA existence: {asha_id}")
+    asha_doc = db.collection("users").document(asha_id).get()
     if not asha_doc.exists or asha_doc.to_dict()["role"] != "ASHA":
-        logger.error(f"ASHA not found or invalid role: {asha_email}")
+        logger.error(f"ASHA not found or invalid role: {asha_id}")
         raise HTTPException(status_code=404, detail="ASHA not found")
     
     # Update patient document
     logger.debug(f"Updating patient {patient_id} with ASHA assignment")
     patient_ref = db.collection("patients").document(patient_id)
     patient_ref.update({
-        "assigned_asha": asha_email,
+        "assigned_asha": asha_id,
         "last_updated": datetime.utcnow()
     })
     
-    logger.info(f"Successfully assigned ASHA {asha_email} to patient {patient_id}")
-    return {"message": f"ASHA {asha_email} assigned to patient {patient_id}"}
-
+    logger.info(f"Successfully assigned ASHA {asha_id} to patient {patient_id}")
+    return {"message": f"ASHA {asha_id} assigned to patient {patient_id}"}
 
 
 @app.get("/patients/my-patients")
@@ -406,8 +432,19 @@ async def get_my_patients(current_user: dict = Depends(verify_user)):
             detail="Only ASHAs can access their patient list"
         )
     
+    # Get the current ASHA's document to find their asha_id
+    asha_doc = db.collection("users").document(current_user["email"]).get()
+    if not asha_doc.exists:
+        raise HTTPException(
+            status_code=404,
+            detail="ASHA user not found"
+        )
+    
+    asha_id = asha_doc.to_dict().get("asha_id")
+    
+    # Query patients using the ASHA's ID
     patients = db.collection("patients")\
-        .where("assigned_asha", "==", current_user["email"])\
+        .where("assigned_ashaid", "==", asha_id)\
         .stream()
     
     return [doc.to_dict() for doc in patients]
