@@ -1,14 +1,12 @@
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from typing import Optional, Literal
 
 class UserBase(BaseModel):
-    email: EmailStr
-    phone: str
+    phone: str = Field(..., description="Phone number with country code (e.g., +911234567890)")
     name: str
 
 class SupervisorCreate(UserBase):
-    password: str
     role: str = "Supervisor"
 
 class ASHACreate(UserBase):
@@ -16,14 +14,10 @@ class ASHACreate(UserBase):
     district: Optional[str] = None
     tehsil: Optional[str] = None
 
-class UserLogin(BaseModel):
-    identifier: str  # Can be email or phone
-    password: str
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
-    password: Optional[str] = None
     profile_picture_url: Optional[str] = None
     location: Optional[str] = None
     district: Optional[str] = None
@@ -32,11 +26,7 @@ class UserUpdate(BaseModel):
     years_of_experience: Optional[int] = None
 
 class User(BaseModel):
-    # Authentication fields
-    email: EmailStr
     phone: str
-    
-    # Basic info
     name: str
     role: str = Field(..., description="'ASHA' or 'Supervisor'")
     
@@ -57,12 +47,11 @@ class User(BaseModel):
     profile_completed: bool = False
     first_login: bool = True
 
-
 class AudioRecording(BaseModel):
     filename: str
-    asha_email: EmailStr
+    asha_phone: str
     patient_id: str
-    supervisor_email: Optional[EmailStr] = None
+    supervisor_phone: Optional[str] = None
     uploaded_at: datetime = Field(default_factory=datetime.utcnow)
     notes: Optional[str] = None
 
@@ -87,6 +76,5 @@ class PatientCreate(BaseModel):
     
     contact: Optional[str]
     address: Optional[str]
-
 
 __all__ = ["UserBase", "SupervisorCreate", "ASHACreate", "UserLogin", "UserUpdate", "User", "AudioRecording", "PatientCreate"]

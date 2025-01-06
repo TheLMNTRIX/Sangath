@@ -1,69 +1,48 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, Form, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from app.config import db
-from app.models import UserLogin, UserUpdate, SupervisorCreate, ASHACreate, AudioRecording, PatientCreate
-from firebase_admin import auth, firestore
-from pydantic import EmailStr
-from datetime import datetime
-from passlib.context import CryptContext
-from typing import Optional
-import random
-import os
-import requests
-import logging
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.security import OAuth2PasswordBearer
+from firebase_admin import auth
+from typing import Optional, List
 import uuid
+from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import asyncio
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from app.models import (
+    SupervisorCreate, ASHACreate, UserUpdate, User, PatientCreate,
+    AudioRecording
 )
-logger = logging.getLogger(__name__)
-app = FastAPI(title="Sangath API")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
-FIREBASE_API_KEY = os.getenv("FIREBASE_WEB_API_KEY")
+from app.config import db
+
+app = FastAPI(title="Sangath Healthcare Application")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins in development
+    allow_origins=["*"],  # For development only. In production, specify your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Middleware to verify Firebase ID token
+# Verify user function as provided
 async def verify_user(token: str = Depends(oauth2_scheme)):
     try:
         if token.startswith('Bearer '):
             token = token.split(' ')[1]
         
-        print(f"Verifying token: {token[:50]}...")
-        
         try:
             decoded_token = auth.verify_id_token(token)
         except Exception as e:
-            print(f"Token: {token[:50]} Token verification failed: {str(e)}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Token verification failed: {str(e)}"
             )
         
-        # Get user data from Firebase Auth
         user = auth.get_user(decoded_token['uid'])
+        user_doc = db.collection("users").document(user.phone_number).get()
         
-        # First try to get document by email (for supervisors)
-        user_doc = db.collection("users").document(user.email).get()
-        
-        # If not found, query by UID to find ASHA document
         if not user_doc.exists:
-            # Query the collection to find document with matching uid
             query = db.collection("users").where("uid", "==", user.uid).limit(1)
-            docs = query.stream()
-            user_docs = list(docs)
+            user_docs = list(query.stream())
             
             if not user_docs:
                 raise HTTPException(
@@ -74,377 +53,323 @@ async def verify_user(token: str = Depends(oauth2_scheme)):
             
         user_data = user_doc.to_dict()
         return {
-            "email": user.email,
+            "phone": user.phone_number,
             "uid": user.uid,
             "role": user_data.get("role"),
-            "doc_id": user_doc.id  # Include document ID for future reference
+            "doc_id": user_doc.id
         }
         
     except Exception as e:
-        print(f"Authentication error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e)
         )
 
-@app.get("/time")
-async def get_server_time():
-    return JSONResponse({
-        "server_time": int(datetime.utcnow().timestamp())
-    })
-
-@app.post("/login", response_model=dict)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    """
-    Temporary login endpoint for Swagger UI testing only.
-    Uses Firebase Admin to authenticate and provides an ID token for Swagger's OAuth2.
-    """
-    try:
-        identifier = form_data.username
-        if identifier.startswith("+"):
-            user = auth.get_user_by_phone_number(identifier)
-        else:
-            user = auth.get_user_by_email(identifier)
-        
-        # Generate a Firebase custom token
-        custom_token = auth.create_custom_token(user.uid).decode('utf-8')
-        
-        # Exchange custom token for an ID token (via Firebase REST API)
-        exchange_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={FIREBASE_API_KEY}"
-        payload = {"token": custom_token, "returnSecureToken": True}
-        response = requests.post(exchange_url, json=payload)
-
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Failed to exchange custom token for ID token")
-        
-        id_token = response.json().get("idToken")
-        if not id_token:
-            raise HTTPException(status_code=500, detail="ID token not found in response")
-        await asyncio.sleep(3)
-        # Return ID token for Swagger OAuth2
-        return {
-            "access_token": id_token,
-            "token_type": "bearer",
-        }
-    except Exception as e:
+# Helper function to check if user is supervisor
+async def verify_supervisor(current_user = Depends(verify_user)):
+    if current_user["role"] != "Supervisor":
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Login failed: {str(e)}"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only supervisors can perform this action"
         )
+    return current_user
 
+async def verify_admin(current_user = Depends(verify_user)):
+    if current_user["role"] != "Admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only administrators can perform this action"
+        )
+    return current_user
 
+# Helper function to check if user is supervisor or admin
+async def verify_supervisor_or_admin(current_user = Depends(verify_user)):
+    if current_user["role"] not in ["Supervisor", "Admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only supervisors or administrators can perform this action"
+        )
+    return current_user
 
-
-@app.post("/register/supervisor", status_code=status.HTTP_201_CREATED)
-async def register_supervisor(user_data: SupervisorCreate):
+@app.post("/supervisors", response_model=User)
+async def register_supervisor(
+    supervisor: SupervisorCreate,
+    current_user: dict = Depends(verify_admin)
+):
+    """Register a new supervisor (Admin only)"""
+    # Check if user already exists in Firestore
+    user_ref = db.collection("users").document(supervisor.phone)
+    if user_ref.get().exists:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User already exists"
+        )
+    
     try:
-        # Debug logging
-        print(f"Attempting to register supervisor: {user_data.email}")
+        # Create Firebase Auth user
+        firebase_user = auth.create_user(
+            phone_number=supervisor.phone,
+            display_name=supervisor.name
+        )
         
-        # Check if user exists
-        if db.collection("users").document(user_data.email).get().exists:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already registered"
-            )
-        
-        # Verify Firebase API key is set
-        if not FIREBASE_API_KEY:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Firebase API key not configured"
-            )
-            
-        try:
-            # Create Firebase Auth user with more detailed error handling
-            firebase_user = auth.create_user(
-                email=user_data.email,
-                password=user_data.password,
-                phone_number=user_data.phone
-            )
-        except Exception as firebase_error:
-            print(f"Firebase user creation failed: {str(firebase_error)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Firebase authentication error: {str(firebase_error)}"
-            )
-
-        # Create User object for Firestore
-        user_doc = {
-            "email": user_data.email,
-            "phone": user_data.phone,
-            "name": user_data.name,
-            "role": "Supervisor",
+        user_data = {
+            **supervisor.model_dump(),
             "created_at": datetime.utcnow(),
             "is_active": True,
-            "first_login": True,
             "profile_completed": False,
+            "first_login": True,
             "uid": firebase_user.uid
         }
         
-        try:
-            db.collection("users").document(user_data.email).set(user_doc)
-        except Exception as db_error:
-            print(f"Firestore operation failed: {str(db_error)}")
-            # Clean up Firebase user if Firestore fails
-            auth.delete_user(firebase_user.uid)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Database error: {str(db_error)}"
-            )
-            
-        return {"message": "Supervisor registered successfully"}
+        # Create Firestore user document
+        user_ref.set(user_data)
+        return User(**user_data)
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Unexpected error in register_supervisor: {str(e)}")
+    except Exception as firebase_error:
+        print(f"Firebase user creation failed: {str(firebase_error)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Registration failed: {str(e)}"
+            detail=f"Firebase authentication error: {str(firebase_error)}"
         )
 
-@app.post("/create/asha", status_code=status.HTTP_201_CREATED)
-async def create_asha(asha_data: ASHACreate, current_user: dict = Depends(verify_user)):
-    logger.info(f"Attempting to create ASHA with email: {asha_data.email}")
-    
-    # Verify supervisor role
-    if current_user["role"] != "Supervisor":
-        logger.error(f"Unauthorized attempt to create ASHA by {current_user['email']}")
+@app.post("/ashas", response_model=User)
+async def register_asha(
+    asha: ASHACreate,
+    current_user: dict = Depends(verify_supervisor_or_admin)
+):
+    """Register a new ASHA worker (Supervisor or Admin)"""
+    # Check if user already exists in Firestore
+    user_ref = db.collection("users").document(asha.phone)
+    if user_ref.get().exists:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Supervisors can create ASHA accounts"
-        )    
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User already exists"
+        )
+    
     try:
-        # Generate 6-digit ASHA ID
-        while True:
-            asha_id = str(random.randint(100000, 999999))
-            # Check if ID already exists
-            if not db.collection("users").document(asha_id).get().exists:
-                break
-                
-        # Generate temporary password
-        temp_password = "asha" + str(random.randint(10000, 99999))
-        logger.debug(f"Generated temporary password for {asha_data.email}")
-        
         # Create Firebase Auth user
-        logger.info(f"Creating Firebase auth user for {asha_data.email}")
         firebase_user = auth.create_user(
-            email=asha_data.email,
-            password=temp_password,
-            phone_number=asha_data.phone
+            phone_number=asha.phone,
+            display_name=asha.name
         )
         
-        logger.info(f"Firebase user created successfully with UID: {firebase_user.uid}")
-        
-        # Create User object for Firestore
-        user_doc = {
-            **asha_data.model_dump(),
-            "asha_id": asha_id,
+        user_data = {
+            **asha.model_dump(),
             "created_at": datetime.utcnow(),
             "is_active": True,
-            "first_login": True,
             "profile_completed": False,
+            "first_login": True,
             "uid": firebase_user.uid,
-            "supervisor_email": current_user["email"]
+            "created_by": current_user["phone"]
         }
         
-        logger.info(f"Adding user document to Firestore for {asha_data.email}")
-        db.collection("users").document(asha_id).set(user_doc)
-        logger.info(f"Successfully created ASHA account for {asha_data.email}")
+        # Create Firestore user document
+        user_ref.set(user_data)
+        return User(**user_data)
         
-        return {
-            "message": "ASHA created successfully", 
-            "temporary_password": temp_password,
-            "asha_id": asha_id
-        }
-    except Exception as e:
-        logger.error(f"Error creating ASHA account: {str(e)}", exc_info=True)
+    except Exception as firebase_error:
+        print(f"Firebase user creation failed: {str(firebase_error)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error creating ASHA account: {str(e)}"
+            detail=f"Firebase authentication error: {str(firebase_error)}"
         )
 
-
-@app.put("/users/update")
+@app.put("/users/{phone}", response_model=User)
 async def update_user(
-    update_data: UserUpdate,
-    token: str = Depends(verify_user)
+    phone: str,
+    user_update: UserUpdate,
+    current_user: dict = Depends(verify_user)
 ):
-    user = auth.verify_id_token(token)
-    user_doc = db.collection("users").document(user["email"])
-    
-    if not user_doc.exists:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    update_dict = update_data.model_dump(exclude_unset=True)
-    
-    # Update password if provided
-    if update_data.password:
-        auth.update_user(user["uid"], password=update_data.password)
-    
-    # Update Firestore
-    user_doc.update({
-        **update_dict,
-        "first_login": False,
-        "profile_completed": True
-    })
-    
-    return {"message": "Profile updated successfully"}
-
-@app.put("/users/profile")
-async def update_profile(
-    profile_data: dict,
-    token: str = Depends(verify_user)
-):
-    user_email = token.get("email")
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Email not found in token")
-    
-    user_ref = db.collection("users").document(user_email)
-    user_ref.update({
-        **profile_data,
-        "profile_completed": True,
-        "last_login": datetime.utcnow()
-    })
-    return {"message": "Profile updated successfully"}
-
-@app.get("/users/profile")
-async def get_profile(token: str = Depends(verify_user)):
-    user_email = token.get("email")
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Email not found in token")
-    
-    user_doc = db.collection("users").document(user_email).get()
-    if not user_doc.exists:
-        raise HTTPException(status_code=404, detail="User not found")
-        
-    # Return the user document data
-    return user_doc.to_dict()
-    
-
-@app.post("/upload-audio/")
-async def upload_audio(
-    file: UploadFile, 
-    asha_email: EmailStr = Form(...), 
-    token: str = Depends(verify_user)
-):
-    user_doc = db.collection("users").document(token.get("email")).get()
-    if not user_doc.exists or user_doc.to_dict().get("role") != "ASHA":
+    """Update user profile"""
+    if current_user["phone"] != phone and current_user["role"] not in ["Supervisor", "Admin"]:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Only ASHAs can upload audio"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Can only update own profile unless supervisor or admin"
         )
-    recording = AudioRecording(filename=file.filename, asha_email=asha_email)
-    db.collection("audio_recordings").add(recording.dict())
-    return {"message": "Audio uploaded successfully", "recording": recording.dict()}
+    
+    user_ref = db.collection("users").document(phone)
+    user_doc = user_ref.get()
+    
+    if not user_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    update_data = {k: v for k, v in user_update.model_dump().items() if v is not None}
+    user_ref.update(update_data)
+    
+    updated_doc = user_ref.get()
+    return User(**updated_doc.to_dict())
 
-@app.get("/audio-recordings/", response_model=list[AudioRecording])
-async def list_audio_recordings(token: str = Depends(verify_user)):
-    user = auth.verify_id_token(token)
-    if user.get("role") != "Supervisor":
-        raise HTTPException(status_code=403, detail="Only Supervisors can access this endpoint.")
-    recordings = db.collection("audio_recordings").stream()
-    return [AudioRecording(**r.to_dict()) for r in recordings]
+@app.get("/users/{phone}", response_model=User)
+async def get_user_profile(
+    phone: str,
+    current_user: dict = Depends(verify_user)
+):
+    """Fetch user profile"""
+    user_ref = db.collection("users").document(phone)
+    user_doc = user_ref.get()
+    
+    if not user_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    return User(**user_doc.to_dict())
 
+@app.delete("/users/{phone}")
+async def delete_user(
+    phone: str,
+    current_user: dict = Depends(verify_admin)
+):
+    """Delete a user"""
+    user_ref = db.collection("users").document(phone)
+    if not user_ref.get().exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Remove ASHA assignments from patients
+    if user_ref.get().to_dict()["role"] == "ASHA":
+        patients_ref = db.collection("patients").where("assigned_ashaid", "==", phone)
+        for patient in patients_ref.stream():
+            patient.reference.update({"assigned_ashaid": None})
+    
+    user_ref.delete()
+    return {"message": "User deleted successfully"}
 
-
-
-@app.post("/patients/create")
+@app.post("/patients", response_model=PatientCreate)
 async def create_patient(
     patient: PatientCreate,
     current_user: dict = Depends(verify_user)
 ):
-    """Create a new patient record"""
-    logger.info(f"Attempting to create patient by user: {current_user['email']}")
+    """Create a new patient"""
+    patient_id = str(uuid.uuid4())
+    patient_ref = db.collection("patients").document(patient_id)
     
-    # Check role first
-    if current_user["role"] != "Supervisor":
-        logger.error(f"Unauthorized attempt to create patient by {current_user['email']} with role {current_user['role']}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Supervisors can create patients"
-        )
+    patient_data = patient.model_dump()
+    patient_data["created_at"] = datetime.utcnow()
+    patient_data["created_by"] = current_user["phone"]
+    
+    patient_ref.set(patient_data)
+    return PatientCreate(**patient_data)
 
-    try:
-        patient_id = str(uuid.uuid4())
-        patient_doc = {
-            **patient.model_dump(),
-            "id": patient_id,
-            "created_at": datetime.utcnow(),
-            "created_by": current_user["email"],
-            "assigned_asha": None
-        }
-        
-        db.collection("patients").document(patient_id).set(patient_doc)
-        return {
-            "message": "Patient created successfully",
-            "id": patient_id
-        }
-    except Exception as e:
-        logger.error(f"Error creating patient: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error creating patient: {str(e)}"
-        )
-
-
-
-@app.post("/patients/{patient_id}/assign-asha")
-async def assign_asha_to_patient(
+@app.put("/patients/{patient_id}")
+async def update_patient(
     patient_id: str,
-    asha_id: str,
+    patient_update: PatientCreate,
     current_user: dict = Depends(verify_user)
 ):
-    logger.info(f"Attempting to assign ASHA {asha_id} to patient {patient_id}")
-    
-    if current_user["role"] != "Supervisor":
-        logger.error(f"Unauthorized attempt to assign ASHA by {current_user['email']}")
-        raise HTTPException(
-            status_code=403,
-            detail="Only Supervisors can assign ASHAs to patients"
-        )
-    
-    # Verify ASHA exists
-    logger.debug(f"Verifying ASHA existence: {asha_id}")
-    asha_doc = db.collection("users").document(asha_id).get()
-    if not asha_doc.exists or asha_doc.to_dict()["role"] != "ASHA":
-        logger.error(f"ASHA not found or invalid role: {asha_id}")
-        raise HTTPException(status_code=404, detail="ASHA not found")
-    
-    # Update patient document
-    logger.debug(f"Updating patient {patient_id} with ASHA assignment")
+    """Update patient details"""
     patient_ref = db.collection("patients").document(patient_id)
-    patient_ref.update({
-        "assigned_asha": asha_id,
-        "last_updated": datetime.utcnow()
-    })
-    
-    logger.info(f"Successfully assigned ASHA {asha_id} to patient {patient_id}")
-    return {"message": f"ASHA {asha_id} assigned to patient {patient_id}"}
-
-
-@app.get("/patients/my-patients")
-async def get_my_patients(current_user: dict = Depends(verify_user)):
-    if current_user["role"] != "ASHA":
+    if not patient_ref.get().exists:
         raise HTTPException(
-            status_code=403,
-            detail="Only ASHAs can access their patient list"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Patient not found"
         )
     
-    # Get the current ASHA's document to find their asha_id
-    asha_doc = db.collection("users").document(current_user["email"]).get()
-    if not asha_doc.exists:
+    update_data = patient_update.model_dump(exclude_unset=True)
+    patient_ref.update(update_data)
+    
+    return {"message": "Patient updated successfully"}
+
+@app.delete("/patients/{patient_id}")
+async def delete_patient(
+    patient_id: str,
+    current_user: dict = Depends(verify_supervisor)
+):
+    """Delete a patient"""
+    patient_ref = db.collection("patients").document(patient_id)
+    if not patient_ref.get().exists:
         raise HTTPException(
-            status_code=404,
-            detail="ASHA user not found"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Patient not found"
         )
     
-    asha_id = asha_doc.to_dict().get("asha_id")
+    patient_ref.delete()
+    return {"message": "Patient deleted successfully"}
+
+@app.put("/patients/{patient_id}/assign")
+async def assign_asha(
+    patient_id: str,
+    asha_phone: str,
+    current_user: dict = Depends(verify_supervisor)
+):
+    """Assign an ASHA to a patient"""
+    # Verify ASHA exists
+    asha_ref = db.collection("users").document(asha_phone)
+    asha_doc = asha_ref.get()
     
-    # Query patients using the ASHA's ID
-    patients = db.collection("patients")\
-        .where("assigned_ashaid", "==", asha_id)\
-        .stream()
+    if not asha_doc.exists or asha_doc.to_dict()["role"] != "ASHA":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid ASHA worker"
+        )
     
-    return [doc.to_dict() for doc in patients]
+    # Update patient
+    patient_ref = db.collection("patients").document(patient_id)
+    if not patient_ref.get().exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Patient not found"
+        )
+    
+    patient_ref.update({"assigned_ashaid": asha_phone})
+    return {"message": "ASHA assigned successfully"}
+
+@app.get("/ashas/{asha_phone}/patients")
+async def get_asha_patients(
+    asha_phone: str,
+    current_user: dict = Depends(verify_user)
+):
+    """Get all patients assigned to an ASHA"""
+    if current_user["phone"] != asha_phone and current_user["role"] != "Supervisor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Can only view own patients unless supervisor"
+        )
+    
+    patients_ref = db.collection("patients").where("assigned_ashaid", "==", asha_phone)
+    patients = [doc.to_dict() for doc in patients_ref.stream()]
+    return patients
+
+@app.post("/patients/{patient_id}/recordings")
+async def upload_recording(
+    patient_id: str,
+    description: str = Form(None),
+    audio_file: UploadFile = File(None),
+    current_user: dict = Depends(verify_user)
+):
+    """Upload an audio recording or text description for a patient session"""
+    if not audio_file and not description:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either audio file or description is required"
+        )
+    
+    patient_ref = db.collection("patients").document(patient_id)
+    if not patient_ref.get().exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Patient not found"
+        )
+    
+    recording_data = {
+        "patient_id": patient_id,
+        "asha_phone": current_user["phone"],
+        "uploaded_at": datetime.utcnow(),
+        "notes": description
+    }
+    
+    if audio_file:
+        # Here you would typically upload the file to storage
+        # and store the URL in recording_data["filename"]
+        recording_data["filename"] = f"recordings/{patient_id}/{uuid.uuid4()}"
+    
+    recording_ref = db.collection("recordings").document()
+    recording_ref.set(recording_data)
+    
+    return {"message": "Recording uploaded successfully"}
