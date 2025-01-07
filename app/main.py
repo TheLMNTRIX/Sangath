@@ -102,6 +102,33 @@ async def verify_supervisor_or_admin(current_user = Depends(verify_user)):
         )
     return current_user
 
+@app.get("/check-role/{phone}")
+async def check_user_role(phone: str):
+    """Check if user exists and return their role"""
+    try:
+        user_ref = db.collection("users").document(phone)
+        user_doc = user_ref.get()
+        
+        if not user_doc.exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        user_data = user_doc.to_dict()
+        return {
+            "exists": True,
+            "role": user_data.get("role", "Unknown")
+        }
+        
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error checking user role: {str(e)}"
+        )
+
 @app.post("/supervisors", response_model=User)
 async def register_supervisor(
     supervisor: SupervisorCreate,
