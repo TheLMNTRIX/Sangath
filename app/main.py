@@ -1,20 +1,22 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
 from fastapi.security import OAuth2PasswordBearer
-from firebase_admin import auth
+from firebase_admin import auth, storage
 from typing import Optional, List
 import uuid
 from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
 import random
-
+from pydantic import ValidationError
+import json
 from app.models import (
     SupervisorCreate, ASHACreate, UserUpdate, User, PatientCreate,
-    AudioRecording, PatientUpdate
+    AudioRecording, PatientUpdate, Session, SessionCreate
 )
 from app.config import db
 
 app = FastAPI(title="Sangath Healthcare Application")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+bucket = storage.bucket('sangath-asha-test.firebasestorage.app')
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,6 +77,11 @@ async def verify_user(token: str = Depends(oauth2_scheme)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e)
         )
+    
+async def generate_recording_filename(patient_id: str, session_number: int, timestamp: datetime) -> str:
+    """Generate unique filename for audio recording"""
+    date_str = timestamp.strftime("%Y%m%d_%H%M%S")
+    return f"audio-recordings/{patient_id}/session_{session_number}_{date_str}.mp3"
 
 # Helper function to check if user is supervisor
 async def verify_supervisor(current_user = Depends(verify_user)):
@@ -455,7 +462,7 @@ async def get_asha_patients(
     patients = [doc.to_dict() for doc in patients_ref.stream()]
     return patients
 
-@app.get("/ashas", response_model=List[User])
+@app.get("/allashas", response_model=List[User])
 async def get_all_ashas(current_user: dict = Depends(verify_supervisor_or_admin)):
     """Get all ASHA workers (Admin and Supervisor only)"""
     try:
@@ -469,7 +476,7 @@ async def get_all_ashas(current_user: dict = Depends(verify_supervisor_or_admin)
         )
     
 
-@app.get("/patients")
+@app.get("/allpatients")
 async def get_all_patients(current_user: dict = Depends(verify_supervisor_or_admin)):
     """Get all patients (Admin and Supervisor only)"""
     try:
@@ -500,40 +507,106 @@ async def get_patient(
     
     return patient_doc.to_dict()
 
-@app.post("/patients/{patient_id}/recordings")
-async def upload_recording(
+@app.post("/patients/{patient_id}/sessions", response_model=Session)
+async def create_session(
     patient_id: str,
-    description: str = Form(None),
-    audio_file: UploadFile = File(None),
+    session_data: str = Form(...),  # Change this to accept string
+    audio_file: Optional[UploadFile] = File(default=None),
     current_user: dict = Depends(verify_user)
 ):
-    """Upload an audio recording or text description for a patient session"""
-    if not audio_file and not description:
+    """Create a new session with optional audio recording"""
+    
+    try:
+        # Parse the session_data JSON string into a SessionCreate model
+        session_data_dict = json.loads(session_data)
+        session_model = SessionCreate(**session_data_dict)
+        
+        # Verify patient exists
+        patient_ref = db.collection("patients").document(patient_id)
+        if not patient_ref.get().exists:
+            raise HTTPException(status_code=404, detail="Patient not found")
+            
+        # Create session document
+        session_data_dict = session_model.model_dump()
+        session_data_dict["asha_id"] = current_user["phone"]
+        session_id = str(uuid.uuid4())
+        
+        if audio_file:
+            # Upload audio to Firebase Storage
+            timestamp = datetime.utcnow()
+            filename = await generate_recording_filename(patient_id, session_model.session_number, timestamp)
+            blob = bucket.blob(filename)
+            
+            # Read and upload file
+            content = await audio_file.read()
+            blob.upload_from_string(content, content_type=audio_file.content_type)
+            
+            # Generate public URL
+            blob.make_public()
+            session_data_dict["recording_url"] = blob.public_url
+        
+        # Add creation timestamp
+        session_data_dict["created_at"] = datetime.utcnow()
+        
+        # Store session in Firestore
+        session_ref = db.collection("sessions").document(session_id)
+        session_ref.set(session_data_dict)
+        
+        return Session(id=session_id, **session_data_dict)
+        
+    except json.JSONDecodeError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Either audio file or description is required"
+            status_code=422,
+            detail="Invalid JSON format in session_data"
+        )
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=str(e)
         )
     
+
+@app.get("/ashas/{asha_id}/recordings", response_model=List[Session])
+async def get_asha_recordings(
+    asha_id: str,
+    current_user: dict = Depends(verify_user)
+):
+    """Get all recordings uploaded by an ASHA"""
+        
+    # First get all sessions by this ASHA
+    sessions = db.collection("sessions")\
+        .where("asha_id", "==", asha_id)\
+        .stream()
+    
+    # Filter for sessions with recordings in Python
+    recordings = [
+        Session(id=session.id, **session.to_dict())
+        for session in sessions
+        if session.to_dict().get("recording_url") is not None
+    ]
+        
+    return recordings
+
+@app.get("/patients/{patient_id}/recordings", response_model=List[Session])
+async def get_patient_recordings(
+    patient_id: str,
+    current_user: dict = Depends(verify_user)
+):
+    """Get all recordings for a specific patient"""
+    # Verify patient exists
     patient_ref = db.collection("patients").document(patient_id)
     if not patient_ref.get().exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Patient not found"
-        )
+        raise HTTPException(status_code=404, detail="Patient not found")
+        
+    sessions = db.collection("sessions")\
+        .where("patient_id", "==", patient_id)\
+        .stream()
     
-    recording_data = {
-        "patient_id": patient_id,
-        "asha_phone": current_user["phone"],
-        "uploaded_at": datetime.utcnow(),
-        "notes": description
-    }
-    
-    if audio_file:
-        # Here you would typically upload the file to storage
-        # and store the URL in recording_data["filename"]
-        recording_data["filename"] = f"recordings/{patient_id}/{uuid.uuid4()}"
-    
-    recording_ref = db.collection("recordings").document()
-    recording_ref.set(recording_data)
-    
-    return {"message": "Recording uploaded successfully"}
+   
+    recordings = [
+        Session(id=session.id, **session.to_dict())
+        for session in sessions
+        if session.to_dict().get("recording_url") is not None
+    ]
+        
+    return recordings

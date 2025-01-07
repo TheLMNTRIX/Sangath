@@ -1,7 +1,8 @@
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from typing import Optional, Literal
-
+from pydantic import ValidationError
+import json
 class UserBase(BaseModel):
     phone: str = Field(..., description="Phone number with country code (e.g., +911234567890)")
     name: str
@@ -101,5 +102,18 @@ class PatientUpdate(BaseModel):
         if info.data.get('high_risk') and not v:
             raise ValueError('Description is required when high risk is True')
         return v
+    
 
-__all__ = ["UserBase", "SupervisorCreate", "ASHACreate", "UserLogin", "UserUpdate", "User", "AudioRecording", "PatientCreate", "PatientUpdate"]
+class SessionCreate(BaseModel):
+    patient_id: str
+    session_number: int = Field(..., ge=1)
+    notes: Optional[str] = None
+    recording_url: Optional[str] = None
+    phq9_score: Optional[int] = None
+
+class Session(SessionCreate):
+    id: str
+    asha_id: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+__all__ = ["UserBase", "SupervisorCreate", "ASHACreate", "UserLogin", "UserUpdate", "User", "AudioRecording", "PatientCreate", "PatientUpdate", "SessionCreate", "Session"]
