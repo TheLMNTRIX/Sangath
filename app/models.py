@@ -73,8 +73,33 @@ class PatientCreate(BaseModel):
         if info.data.get('high_risk') and not v:
             raise ValueError('Description is required when high risk is True')
         return v
-    
     contact: Optional[str]
     address: Optional[str]
+    patient_id: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
-__all__ = ["UserBase", "SupervisorCreate", "ASHACreate", "UserLogin", "UserUpdate", "User", "AudioRecording", "PatientCreate"]
+
+
+class PatientUpdate(BaseModel):
+    name: Optional[str] = None
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    district: Optional[str] = None
+    assigned_ashaid: Optional[str] = None
+    block_no: Optional[str] = None
+    ward_no: Optional[str] = None
+    rch_id: Optional[str] = None
+    pregnancy_state: Optional[Literal["ANC", "PNC"]] = None
+    high_risk: Optional[bool] = None
+    high_risk_description: Optional[str] = None
+    contact: Optional[str] = None
+    address: Optional[str] = None
+
+    @field_validator('high_risk_description')
+    def validate_high_risk_description(cls, v: Optional[str], info) -> Optional[str]:
+        if info.data.get('high_risk') and not v:
+            raise ValueError('Description is required when high risk is True')
+        return v
+
+__all__ = ["UserBase", "SupervisorCreate", "ASHACreate", "UserLogin", "UserUpdate", "User", "AudioRecording", "PatientCreate", "PatientUpdate"]

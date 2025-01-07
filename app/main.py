@@ -5,10 +5,11 @@ from typing import Optional, List
 import uuid
 from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
+import random
 
 from app.models import (
     SupervisorCreate, ASHACreate, UserUpdate, User, PatientCreate,
-    AudioRecording
+    AudioRecording, PatientUpdate
 )
 from app.config import db
 
@@ -22,6 +23,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+async def generate_patient_id():
+    """Generate a unique 8-digit patient ID"""
+    while True:
+        # Generate a random 8-digit number
+        patient_id = str(random.randint(10000000, 99999999))
+        
+        # Check if this ID already exists
+        if not db.collection("patients").document(patient_id).get().exists:
+            return patient_id
 
 # Verify user function as provided
 async def verify_user(token: str = Depends(oauth2_scheme)):
@@ -224,35 +235,61 @@ async def delete_user(
     phone: str,
     current_user: dict = Depends(verify_admin)
 ):
-    """Delete a user"""
+    """Delete a user and their Firebase Auth account"""
     user_ref = db.collection("users").document(phone)
-    if not user_ref.get().exists:
+    user_doc = user_ref.get()
+    
+    if not user_doc.exists:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
     
-    # Remove ASHA assignments from patients
-    if user_ref.get().to_dict()["role"] == "ASHA":
-        patients_ref = db.collection("patients").where("assigned_ashaid", "==", phone)
-        for patient in patients_ref.stream():
-            patient.reference.update({"assigned_ashaid": None})
+    user_data = user_doc.to_dict()
     
-    user_ref.delete()
-    return {"message": "User deleted successfully"}
+    try:
+        # Delete Firebase Auth user
+        auth.delete_user(user_data["uid"])
+        
+        # Remove ASHA assignments from patients if user is an ASHA
+        if user_data["role"] == "ASHA":
+            patients_ref = db.collection("patients").where("assigned_ashaid", "==", phone)
+            for patient in patients_ref.stream():
+                patient.reference.update({"assigned_ashaid": None})
+        
+        # Delete Firestore user document
+        user_ref.delete()
+        
+        return {"message": "User and authentication deleted successfully"}
+        
+    except Exception as firebase_error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error deleting user: {str(firebase_error)}"
+        )
 
 @app.post("/patients", response_model=PatientCreate)
 async def create_patient(
     patient: PatientCreate,
-    current_user: dict = Depends(verify_user)
+    current_user: dict = Depends(verify_supervisor)
 ):
-    """Create a new patient"""
-    patient_id = str(uuid.uuid4())
+    
+    user_doc = db.collection("users").document(current_user["doc_id"]).get()
+    user_data = user_doc.to_dict()
+    creator_name = user_data.get("name", "Unknown User")
+
+    """Create a new patient with 8-digit ID"""
+    # Generate unique 8-digit patient ID
+    patient_id = await generate_patient_id()
+    
     patient_ref = db.collection("patients").document(patient_id)
     
     patient_data = patient.model_dump()
-    patient_data["created_at"] = datetime.utcnow()
-    patient_data["created_by"] = current_user["phone"]
+    patient_data.update({
+        "created_at": datetime.utcnow(),
+        "created_by": creator_name,
+        "patient_id": patient_id  # Store the ID in the document as well
+    })
     
     patient_ref.set(patient_data)
     return PatientCreate(**patient_data)
@@ -260,21 +297,57 @@ async def create_patient(
 @app.put("/patients/{patient_id}")
 async def update_patient(
     patient_id: str,
-    patient_update: PatientCreate,
-    current_user: dict = Depends(verify_user)
+    patient_update: PatientUpdate,  # Use PatientUpdate instead of PatientCreate
+    current_user: dict = Depends(verify_supervisor)
 ):
     """Update patient details"""
     patient_ref = db.collection("patients").document(patient_id)
-    if not patient_ref.get().exists:
+    patient_doc = patient_ref.get()
+    
+    if not patient_doc.exists:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Patient not found"
         )
     
-    update_data = patient_update.model_dump(exclude_unset=True)
+    # Get current patient data
+    current_data = patient_doc.to_dict()
+    
+    # Get only the fields that were provided in the update
+    update_data = {
+        k: v for k, v in patient_update.model_dump().items()
+        if v is not None  # Only include fields that were explicitly set
+    }
+    
+    # Special handling for high_risk and high_risk_description
+    if 'high_risk' in update_data:
+        if update_data['high_risk']:
+            if not update_data.get('high_risk_description') and not current_data.get('high_risk_description'):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Description is required when high risk is True"
+                )
+        else:
+            # If high_risk is set to False, remove the description
+            update_data['high_risk_description'] = None
+    
+    if not update_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid update data provided"
+        )
+    
+    # Preserve read-only fields
+    update_data.pop('patient_id', None)
+    update_data.pop('created_by', None)
+    update_data.pop('created_at', None)
+    
+    # Update the document
     patient_ref.update(update_data)
     
-    return {"message": "Patient updated successfully"}
+    # Return updated patient data
+    updated_doc = patient_ref.get()
+    return {"message": "Patient updated successfully", "data": updated_doc.to_dict()}
 
 @app.delete("/patients/{patient_id}")
 async def delete_patient(
@@ -299,19 +372,38 @@ async def assign_asha(
     current_user: dict = Depends(verify_supervisor)
 ):
     """Assign an ASHA to a patient"""
+    print(f"Attempting to assign ASHA. Phone: {asha_phone}, Patient ID: {patient_id}")
+    
     # Verify ASHA exists
     asha_ref = db.collection("users").document(asha_phone)
     asha_doc = asha_ref.get()
     
-    if not asha_doc.exists or asha_doc.to_dict()["role"] != "ASHA":
+    print(f"ASHA document exists: {asha_doc.exists}")
+    if asha_doc.exists:
+        asha_data = asha_doc.to_dict()
+        print(f"ASHA document data: {asha_data}")
+        print(f"ASHA role: {asha_data.get('role')}")
+    
+    if not asha_doc.exists:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid ASHA worker"
+            detail=f"ASHA with phone {asha_phone} not found"
+        )
+    
+    asha_data = asha_doc.to_dict()
+    if asha_data["role"] != "ASHA":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"User with phone {asha_phone} is not an ASHA worker"
         )
     
     # Update patient
     patient_ref = db.collection("patients").document(patient_id)
-    if not patient_ref.get().exists:
+    patient_doc = patient_ref.get()
+    
+    print(f"Patient document exists: {patient_doc.exists}")
+    
+    if not patient_doc.exists:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Patient not found"
@@ -335,6 +427,23 @@ async def get_asha_patients(
     patients_ref = db.collection("patients").where("assigned_ashaid", "==", asha_phone)
     patients = [doc.to_dict() for doc in patients_ref.stream()]
     return patients
+
+@app.get("/patients/{patient_id}")
+async def get_patient(
+    patient_id: str,
+    current_user: dict = Depends(verify_user)
+):
+    """Get patient details by ID"""
+    patient_ref = db.collection("patients").document(patient_id)
+    patient_doc = patient_ref.get()
+    
+    if not patient_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Patient not found"
+        )
+    
+    return patient_doc.to_dict()
 
 @app.post("/patients/{patient_id}/recordings")
 async def upload_recording(
