@@ -14,25 +14,28 @@ No specific rate limiting is implemented, but standard Firebase quotas apply.
 
 ## User Roles
 The API supports three user roles:
-- Admin
-- Supervisor
-- ASHA (Healthcare Worker)
+- Admin: Full system access and user management
+- Supervisor: Patient management and ASHA oversight
+- ASHA (Healthcare Worker): Patient interaction and session management
 
 ## Endpoints
 
-### Server Time
-Get the current server time.
+### User Management
 
-**Endpoint**: `GET /time`  
+#### Check User Role
+Check if a user exists and get their role.
+
+**Endpoint**: `GET /check-role/{phone}`  
 **Authentication**: Not required  
+**URL Parameters**:
+- `phone`: User's phone number with country code
 **Response**:
 ```json
 {
-    "server_time": 1704200000  // Unix timestamp
+    "exists": true,
+    "role": "ASHA"  // or "Supervisor", "Admin", "Unknown"
 }
 ```
-
-### User Management
 
 #### Register Supervisor
 Create a new supervisor account (Admin only).
@@ -81,6 +84,26 @@ Create a new ASHA worker account (Supervisor or Admin only).
 }
 ```
 **Response**: Returns complete user object similar to supervisor registration.
+
+#### Get All ASHA Workers
+Retrieve a list of all ASHA workers.
+
+**Endpoint**: `GET /allashas`  
+**Authentication**: Required (Supervisor or Admin only)  
+**Response**: Returns array of User objects
+```json
+[
+    {
+        "phone": "+919876543210",
+        "name": "ASHA Name",
+        "role": "ASHA",
+        "district": "District Name",
+        "profile_picture_url": "string?",
+        "is_active": true,
+        // ... other User model fields
+    }
+]
+```
 
 #### Update User Profile
 Update a user's profile information.
@@ -153,7 +176,14 @@ Create a new patient record (Supervisor only).
     "address": "Patient Address"        // Optional
 }
 ```
-**Response**: Returns created patient object with generated patient_id.
+**Response**: Returns created patient object with generated 8-digit patient_id.
+
+#### Get All Patients
+Retrieve all patients in the system.
+
+**Endpoint**: `GET /allpatients`  
+**Authentication**: Required (Supervisor or Admin only)  
+**Response**: Returns array of patient objects with complete patient information.
 
 #### Update Patient
 Update patient information (Supervisor only).
@@ -166,6 +196,7 @@ Update patient information (Supervisor only).
 **Notes**:
 - If `high_risk` is set to true, `high_risk_description` is required
 - If `high_risk` is set to false, `high_risk_description` will be set to null
+- Cannot modify patient_id, created_by, or created_at fields
 **Response**:
 ```json
 {
@@ -229,27 +260,72 @@ Retrieve details for a specific patient.
 - `patient_id`: Patient's unique ID
 **Response**: Returns complete patient object.
 
-### Recording Management
+### Session Management
 
-#### Upload Patient Recording
-Upload an audio recording or text description for a patient session.
+#### Create Session
+Create a new session for a patient with optional audio recording.
 
-**Endpoint**: `POST /patients/{patient_id}/recordings`  
+**Endpoint**: `POST /patients/{patient_id}/sessions`  
 **Authentication**: Required  
 **URL Parameters**:
-- `patient_id`: Patient's unique ID
-**Request Body**: 
-- Multipart form data with:
-  - `description`: Optional text description
-  - `audio_file`: Optional audio file
-**Notes**:
-- At least one of description or audio_file must be provided
+- `patient_id`: Patient's unique ID  
+**Request Body**: Multipart form data with:
+- `session_data`: JSON string containing:
+```json
+{
+    "session_number": 1,        // Required, must be >= 1
+    "notes": "Session notes",   // Optional
+    "phq9_score": 10           // Optional, PHQ-9 depression screening score
+}
+```
+- `audio_file`: Optional audio recording file
 **Response**:
 ```json
 {
-    "message": "Recording uploaded successfully"
+    "id": "uuid-string",
+    "patient_id": "string",
+    "session_number": 1,
+    "notes": "string?",
+    "recording_url": "string?",
+    "phq9_score": "number?",
+    "asha_id": "string",
+    "created_at": "datetime"
 }
 ```
+
+### Recording Management
+
+#### Get ASHA's Recordings
+Retrieve all recordings uploaded by an ASHA worker.
+
+**Endpoint**: `GET /ashas/{asha_id}/recordings`  
+**Authentication**: Required  
+**URL Parameters**:
+- `asha_id`: ASHA worker's phone number
+**Response**: Returns array of Session objects with recordings
+```json
+[
+    {
+        "id": "uuid-string",
+        "patient_id": "string",
+        "session_number": 1,
+        "notes": "string?",
+        "recording_url": "string",
+        "phq9_score": "number?",
+        "asha_id": "string",
+        "created_at": "datetime"
+    }
+]
+```
+
+#### Get Patient's Recordings
+Retrieve all recordings for a specific patient.
+
+**Endpoint**: `GET /patients/{patient_id}/recordings`  
+**Authentication**: Required  
+**URL Parameters**:
+- `patient_id`: Patient's unique ID
+**Response**: Returns array of Session objects with recordings (same format as ASHA's recordings)
 
 ## Error Responses
 The API returns standard HTTP status codes along with error messages:
@@ -311,14 +387,62 @@ Example error response:
 }
 ```
 
-### Recording Model
+### Session Model
 ```json
 {
-    "filename": "string",       // Required for audio uploads
-    "asha_phone": "string",    // Required
-    "patient_id": "string",    // Required
-    "supervisor_phone": "string?",
-    "uploaded_at": "datetime",
-    "notes": "string?"
+    "id": "string",              // UUID
+    "patient_id": "string",      // Required
+    "session_number": "number",  // Required, >= 1
+    "notes": "string?",
+    "recording_url": "string?",
+    "phq9_score": "number?",
+    "asha_id": "string",        // Set automatically from authenticated user
+    "created_at": "datetime"    // Set automatically
 }
 ```
+
+## Important Notes for Frontend Implementation
+
+1. **Authentication and Authorization**:
+   - Maintain updated Firebase ID token
+   - Include token in all authenticated requests
+   - Handle token refresh appropriately
+   - Implement role-based access control in UI
+   - Store user role information securely
+
+2. **File Upload Requirements**:
+   - Audio recordings must use multipart/form-data
+   - Session data must be stringified JSON
+   - Handle large file uploads with proper progress indication
+   - Implement retry mechanism for failed uploads
+
+3. **Data Validation**:
+   - Validate phone numbers include country code
+   - Ensure session numbers are positive integers
+   - Validate required vs optional fields
+   - Handle high-risk patient requirements
+   - Implement client-side validation matching server requirements
+
+4. **Error Handling**:
+   - Implement comprehensive error handling
+   - Show appropriate user feedback for all error cases
+   - Handle network errors gracefully
+   - Implement proper loading states
+
+5. **Patient Management**:
+   - Handle 8-digit patient IDs properly
+   - Maintain patient assignment workflow
+   - Implement proper high-risk patient workflows
+   - Preserve read-only fields during updates
+
+6. **Session Management**:
+   - Track session numbers sequentially
+   - Handle audio file caching appropriately
+   - Implement proper PHQ-9 score tracking
+   - Manage session history effectively
+
+7. **Performance Considerations**:
+   - Implement proper pagination where needed
+   - Cache appropriate data locally
+   - Optimize audio file handling
+   - Handle large lists efficiently
