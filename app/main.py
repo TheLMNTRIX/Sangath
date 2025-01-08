@@ -476,6 +476,20 @@ async def get_all_ashas(current_user: dict = Depends(verify_supervisor_or_admin)
         )
     
 
+@app.get("/allsupervisor", response_model=List[User])
+async def get_all_ashas(current_user: dict = Depends(verify_admin)):
+    """Get all supervisor workers (Admin only)"""
+    try:
+        users_ref = db.collection("users").where("role", "==", "Supervisor")
+        ashas = [User(**doc.to_dict()) for doc in users_ref.stream()]
+        return ashas
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching ASHA workers: {str(e)}"
+        )
+    
+
 @app.get("/allpatients")
 async def get_all_patients(current_user: dict = Depends(verify_supervisor_or_admin)):
     """Get all patients (Admin and Supervisor only)"""
