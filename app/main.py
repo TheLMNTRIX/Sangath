@@ -305,14 +305,20 @@ async def delete_user(
 @app.post("/patients", response_model=PatientCreate)
 async def create_patient(
     patient: PatientCreate,
-    current_user: dict = Depends(verify_supervisor)
+    current_user: dict = Depends(verify_user)  # Changed from verify_supervisor to verify_user
 ):
+    """Create a new patient with 8-digit ID and assign to creating ASHA"""
+    # Check if the current user is an ASHA or Supervisor/Admin
+    if current_user["role"] not in ["ASHA", "Supervisor", "Admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only ASHA workers, supervisors, and admins can create patients"
+        )
     
     user_doc = db.collection("users").document(current_user["doc_id"]).get()
     user_data = user_doc.to_dict()
     creator_name = user_data.get("name", "Unknown User")
 
-    """Create a new patient with 8-digit ID"""
     # Generate unique 8-digit patient ID
     patient_id = await generate_patient_id()
     
@@ -322,8 +328,12 @@ async def create_patient(
     patient_data.update({
         "created_at": datetime.utcnow(),
         "created_by": creator_name,
-        "patient_id": patient_id  # Store the ID in the document as well
+        "patient_id": patient_id,  # Store the ID in the document as well
     })
+
+    # If the creator is an ASHA, automatically assign the patient to them
+    if current_user["role"] == "ASHA":
+        patient_data["assigned_ashaid"] = current_user["phone"]
     
     patient_ref.set(patient_data)
     return PatientCreate(**patient_data)
@@ -332,7 +342,7 @@ async def create_patient(
 async def update_patient(
     patient_id: str,
     patient_update: PatientUpdate,  # Use PatientUpdate instead of PatientCreate
-    current_user: dict = Depends(verify_supervisor)
+    current_user: dict = Depends(verify_user)
 ):
     """Update patient details"""
     patient_ref = db.collection("patients").document(patient_id)
@@ -386,7 +396,7 @@ async def update_patient(
 @app.delete("/patients/{patient_id}")
 async def delete_patient(
     patient_id: str,
-    current_user: dict = Depends(verify_supervisor)
+    current_user: dict = Depends(verify_user)
 ):
     """Delete a patient"""
     patient_ref = db.collection("patients").document(patient_id)
@@ -403,7 +413,7 @@ async def delete_patient(
 async def assign_asha(
     patient_id: str,
     asha_phone: str,
-    current_user: dict = Depends(verify_supervisor)
+    current_user: dict = Depends(verify_user)
 ):
     """Assign an ASHA to a patient"""
     print(f"Attempting to assign ASHA. Phone: {asha_phone}, Patient ID: {patient_id}")

@@ -65,7 +65,7 @@ class PatientCreate(BaseModel):
     block_no: Optional[str] = None
     ward_no: Optional[str] = None
     rch_id: Optional[str] = None
-    pregnancy_state: Optional[Literal["ANC", "PNC"]] = None
+    pregnancy_state: Optional[Literal["ANC", "PNC", "NA"]] = None
 
     high_risk: Optional[bool] = False
     high_risk_description: Optional[str] = None
