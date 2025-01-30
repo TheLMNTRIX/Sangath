@@ -66,7 +66,7 @@ class PatientCreate(BaseModel):
     ward_no: Optional[str] = None
     rch_id: Optional[str] = None
     pregnancy_state: Optional[Literal["ANC", "PNC", "NA"]] = None
-
+    pregnancy_months: Optional[int] = None
     high_risk: Optional[bool] = False
     high_risk_description: Optional[str] = None
     @field_validator('high_risk_description')
@@ -92,6 +92,7 @@ class PatientUpdate(BaseModel):
     ward_no: Optional[str] = None
     rch_id: Optional[str] = None
     pregnancy_state: Optional[Literal["ANC", "PNC"]] = None
+    pregnancy_months: Optional[int] = None
     high_risk: Optional[bool] = None
     high_risk_description: Optional[str] = None
     contact: Optional[str] = None
