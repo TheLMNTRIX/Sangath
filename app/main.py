@@ -16,7 +16,7 @@ from app.config import db
 
 app = FastAPI(title="Sangath Healthcare Application")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-bucket = storage.bucket('sangath-asha-test.firebasestorage.app')
+bucket = storage.bucket('empower-fe4ba.firebasestorage.app')
 
 app.add_middleware(
     CORSMiddleware,
