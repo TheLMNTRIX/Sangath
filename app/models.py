@@ -14,7 +14,7 @@ class ASHACreate(UserBase):
     role: str = "ASHA"
     district: Optional[str] = None
     tehsil: Optional[str] = None
-
+    assigned_asha_id: Optional[str] = None # New field
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -30,6 +30,7 @@ class User(BaseModel):
     phone: str
     name: str
     role: str = Field(..., description="'ASHA' or 'Supervisor'")
+    assigned_asha_id: Optional[str] = None # New field for ASHA users
     
     # Additional details
     profile_picture_url: Optional[str] = None
@@ -58,8 +59,8 @@ class AudioRecording(BaseModel):
 
 class PatientCreate(BaseModel):
     name: str
-    age: int
-    gender: str
+    age: Optional[int] = None # Made optional
+    gender: Optional[str] = None # Made optional
     district: Optional[str] = None
     assigned_ashaid: Optional[str] = None
     block_no: Optional[str] = None
@@ -69,6 +70,9 @@ class PatientCreate(BaseModel):
     pregnancy_months: Optional[int] = None
     high_risk: Optional[bool] = False
     high_risk_description: Optional[str] = None
+    district_no: Optional[int] = None # New field
+    assigned_patient_id: Optional[str] = None # New field
+
     @field_validator('high_risk_description')
     def validate_high_risk_description(cls, v: Optional[str], info) -> Optional[str]:
         if info.data.get('high_risk') and not v:
@@ -80,12 +84,10 @@ class PatientCreate(BaseModel):
     created_by: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-
-
 class PatientUpdate(BaseModel):
     name: Optional[str] = None
-    age: Optional[int] = None
-    gender: Optional[str] = None
+    age: Optional[int] = None # Ensure it's optional if not already
+    gender: Optional[str] = None # Ensure it's optional if not already
     district: Optional[str] = None
     assigned_ashaid: Optional[str] = None
     block_no: Optional[str] = None
@@ -97,6 +99,7 @@ class PatientUpdate(BaseModel):
     high_risk_description: Optional[str] = None
     contact: Optional[str] = None
     address: Optional[str] = None
+    district_no: Optional[int] = None # New field
 
     @field_validator('high_risk_description')
     def validate_high_risk_description(cls, v: Optional[str], info) -> Optional[str]:
